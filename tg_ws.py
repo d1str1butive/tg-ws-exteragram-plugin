@@ -22,9 +22,8 @@ except ImportError:
 __id__ = "tg_ws_proxy_plugin"
 __name__ = "tg-ws"
 __description__ = "Local SOCKS5 proxy masking telegram traffic as websocket."
-__icon__ = "tg_ws_proxy/1"
 __author__ = "d1str1butive (port), Flowseal (core)"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __min_version__ = "11.12.0"
 
 _TCP_NODELAY = True
@@ -277,7 +276,7 @@ class RawWebSocket:
 
         frame = self._build_frame(self.OP_BINARY, data, mask=True)
         self.writer.write(frame)
-        if self.writer.transport.get_write_buffer_size() > 262144:
+        if self.writer.transport.get_write_buffer_size() > 65536:
             await self.writer.drain()
 
     async def send_batch(self, parts: List[bytes]):
@@ -288,7 +287,7 @@ class RawWebSocket:
             frame = self._build_frame(self.OP_BINARY, part, mask=True)
             self.writer.write(frame)
 
-        if self.writer.transport.get_write_buffer_size() > 262144:
+        if self.writer.transport.get_write_buffer_size() > 65536:
             await self.writer.drain()
 
     async def recv(self) -> Optional[bytes]:
@@ -384,6 +383,85 @@ class RawWebSocket:
         payload = await self.reader.readexactly(payload_length)
         return opcode, payload
 
+class _WsPool:
+    def __init__(self):
+        self._idle: Dict[Tuple[int, bool], list] = {}
+        self._refilling: Set[Tuple[int, bool]] = set()
+
+    async def get(self, dc: int, is_media: bool, target_ip: str, domains: List[str]) -> Optional[RawWebSocket]:
+        key = (dc, is_media)
+        now = time.monotonic()
+
+        bucket = self._idle.get(key, [])
+        while bucket:
+            ws, created = bucket.pop(0)
+            age = now - created
+            if age > _WS_POOL_MAX_AGE or ws._closed:
+                asyncio.create_task(self._quiet_close(ws))
+                continue
+            self._schedule_refill(key, target_ip, domains)
+            return ws
+
+        self._schedule_refill(key, target_ip, domains)
+        return None
+
+    def _schedule_refill(self, key, target_ip, domains):
+        if key in self._refilling:
+            return
+        self._refilling.add(key)
+        asyncio.create_task(self._refill(key, target_ip, domains))
+
+    async def _refill(self, key, target_ip, domains):
+        try:
+            bucket = self._idle.setdefault(key, [])
+            needed = _WS_POOL_SIZE - len(bucket)
+            if needed <= 0:
+                return
+            tasks = []
+            for _ in range(needed):
+                tasks.append(asyncio.create_task(self._connect_one(target_ip, domains)))
+            for t in tasks:
+                try:
+                    ws = await t
+                    if ws:
+                        bucket.append((ws, time.monotonic()))
+                except Exception:
+                    pass
+        finally:
+            self._refilling.discard(key)
+
+    @staticmethod
+    async def _connect_one(target_ip, domains) -> Optional[RawWebSocket]:
+        for domain in domains:
+            try:
+                ws = await RawWebSocket.connect(target_ip, domain, timeout=8)
+                return ws
+            except WsHandshakeError as exc:
+                if exc.is_redirect:
+                    continue
+                return None
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    async def _quiet_close(ws):
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+    async def warmup(self, dc_opt: Dict[int, str]):
+        for dc, target_ip in dc_opt.items():
+            if target_ip is None:
+                continue
+            for is_media in (False, True):
+                domains = _ws_domains(dc, is_media)
+                key = (dc, is_media)
+                self._schedule_refill(key, target_ip, domains)
+
+_ws_pool = _WsPool()
+
 def _is_telegram_ip(ip_address: str) -> bool:
     try:
         ip_num = struct.unpack('!I', _socket.inet_aton(ip_address))[0]
@@ -407,7 +485,7 @@ async def _bridge_ws(local_reader, local_writer, ws: RawWebSocket, label, dc=Non
     async def tcp_to_ws():
         try:
             while True:
-                chunk = await local_reader.read(262144)
+                chunk = await local_reader.read(65536)
                 if not chunk:
                     break
                 if splitter:
@@ -428,7 +506,7 @@ async def _bridge_ws(local_reader, local_writer, ws: RawWebSocket, label, dc=Non
                 if data is None:
                     break
                 local_writer.write(data)
-                if local_writer.transport.get_write_buffer_size() > 262144:
+                if local_writer.transport.get_write_buffer_size() > 65536:
                     await local_writer.drain()
         except Exception:
             return
@@ -453,11 +531,11 @@ async def _bridge_tcp(local_reader, local_writer, remote_reader, remote_writer, 
     async def forward_stream(source_reader, destination_writer):
         try:
             while True:
-                data = await source_reader.read(262144)
+                data = await source_reader.read(65536)
                 if not data:
                     break
                 destination_writer.write(data)
-                if destination_writer.transport.get_write_buffer_size() > 262144:
+                if destination_writer.transport.get_write_buffer_size() > 65536:
                     await destination_writer.drain()
         except Exception:
             pass
@@ -565,6 +643,7 @@ class WsProxyPlugin(BasePlugin):
     def run_proxy_server(self, port):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+        self.loop.create_task(_ws_pool.warmup(self.dc_opt))
         try:
             self.server = self.loop.run_until_complete(
                 asyncio.start_server(self.handle_client, '127.0.0.1', port, limit=1048576)
@@ -686,17 +765,19 @@ class WsProxyPlugin(BasePlugin):
 
             domains = _ws_domains(dc, is_media)
             target_ip = self.dc_opt[dc]
-            websocket_conn = None
+            
+            websocket_conn = await _ws_pool.get(dc, is_media, target_ip, domains)
 
-            for domain in domains:
-                try:
-                    websocket_conn = await RawWebSocket.connect(target_ip, domain, timeout=20.0)
-                    break
-                except WsHandshakeError as exc:
-                    if exc.is_redirect:
-                        continue
-                except Exception:
-                    pass
+            if not websocket_conn:
+                for domain in domains:
+                    try:
+                        websocket_conn = await RawWebSocket.connect(target_ip, domain, timeout=20.0)
+                        break
+                    except WsHandshakeError as exc:
+                        if exc.is_redirect:
+                            continue
+                    except Exception:
+                        pass
 
             if websocket_conn is None:
                 _dc_fail_until[dc_key] = current_time + _DC_FAIL_COOLDOWN
@@ -724,11 +805,11 @@ class WsProxyPlugin(BasePlugin):
     async def pipe_stream(self, reader_stream, writer_stream):
         try:
             while True:
-                data = await reader_stream.read(262144)
+                data = await reader_stream.read(65536)
                 if not data:
                     break
                 writer_stream.write(data)
-                if writer_stream.transport.get_write_buffer_size() > 262144:
+                if writer_stream.transport.get_write_buffer_size() > 65536:
                     await writer_stream.drain()
         except Exception:
             pass
